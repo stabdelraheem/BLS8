@@ -1,0 +1,359 @@
+---
+title: "BLS8 Scout-DSA Tx Summary Data"
+author: "Salma Abdel-Raheem"
+format: html
+editor: visual
+---
+
+## BLS8
+
+This is an overview of how I've compiled and processed the summary data I am presenting at the BLS8 conference in March 2024
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = here::here())
+library(lubridate)
+library(tidyverse)
+```
+
+## Transmitted Bio-logging Data
+
+Processing transmitted (Tx) Data from Wildlife Computers Scout DSA tags that were deployed on 64 northern elephant seals (NES).
+
+The following are metrics of interest for presentation:
+
+Where do they go?
+
+-   max latitude
+
+-   max longitude
+
+-   distributions of lat/long –\> if time
+
+-   distance from colony (check if code works, omit if not)
+
+-   distance from shore (probably not)
+
+What do they do while they're there?
+
+-   Dive Duration
+
+    -   avg + max
+
+-   dive depth
+
+    -   avg + max dive depth
+
+    -   frequency of dives per trip (box plot, 4 for each sex, group by age and color by sex) -\> nested box plot
+
+    -   distribution of depth by age x sex (secondary)
+
+-   Prey Capture Attempts
+
+    -   per dive
+
+    -   per day
+
+-   Surface Interval
+
+    -   Average across all dives
+
+    -   Maximum across all dives
+
+How does that affect fitness?
+
+-   growth (mass gain, structural growth i.e. length)
+
+-   survival
+
+-   trip duration (arrive and depart/last obs dates)
+
+#### Importing and tidying up Morphology + Tx data
+
+```{r MoRphs data, message=FALSE, warning=FALSE}
+morphs_full <- read_csv("data/Morphs_US_Crocker_RoDBLS8.csv", 
+                        na = c("Pt.Reyes", "NA"))
+
+#Trim to include only metadata, curve + straight lengths, and actual mass
+morphs_trim <- morphs_full %>% 
+  select(-8:-15, -18:-19, -matches("_girth"))
+
+#Creating a df where each seal has one row for deployment AND recovery (if applicable)
+
+#First create a df in which I filter out seals that were deployed AND recovered (RoD2022-n = 22, RoD2023-n = 21 * 2 for each season [deployment + recovery] = 86 rows)
+morphs_repeats <- morphs_trim %>%
+  group_by(topp_id) %>%
+  filter(n() > 1)
+
+# Pivot wider
+morphs_pivot <- morphs_repeats %>%
+  pivot_wider(names_from = tagging_procedure, values_from = 
+                c(date, curve_length, standard_length, actual_mass))
+
+#Let's create a new df that has information for animals that were NOT recovered, (RoD2022-n = 10, RoD2023-n = 11 = 21 rows) & format it to match the pivoted df 
+morphs_depONLY <- morphs_trim %>%
+  group_by(topp_id) %>%
+  filter(n() == 1) %>% 
+  #delete the procedure type column as that was "used up" when pivoting 
+  select(-tagging_procedure) %>% 
+  #move the date column to match the pivoted df
+  relocate(date, .before = curve_length) %>% 
+  #rename the date, lengths, and mass colums to reflect deployment measurements
+  rename(date_Deployment = date, 
+         curve_length_Deployment = curve_length,
+         standard_length_Deployment = standard_length, 
+         actual_mass_Deployment = actual_mass) %>% 
+#create empty date, lengths, and mass columns and populate them with NAs to match     the structure of the pivoted df
+  add_column(date_Recovery = NA, .after = "date_Deployment") %>% 
+  add_column(curve_length_Recovery = NA, .after = "curve_length_Deployment") %>% 
+  add_column(standard_length_Recovery = NA, .after = "standard_length_Deployment") %>%
+  add_column(actual_mass_Recovery = NA, .after = "actual_mass_Deployment")
+
+# Now combined the recovered and unrecovered seals dfs
+morphs_combined <- bind_rows(morphs_pivot, morphs_depONLY) %>% 
+  arrange(topp_id)
+
+```
+
+```{r Tx data, message=FALSE, warning=FALSE}
+#Create a vector of all relevant data files and their paths
+transmitted_dat <- dir('/Users/salmaabdel-raheem/Documents/GitHub/PhD/RoD/Transmitted/', 
+                   pattern = '.*DSA.csv', 
+                   recursive = TRUE, 
+                   full.names = TRUE) 
+
+#Merges all data files into one csv - no need for rbind!
+transmitted_dat <- read_csv(transmitted_dat, id = "file") 
+
+#Cleaning up the imported data & adding info like dive number, separating out
+#DeployID into age, sex, and sealID columns
+transmitted_f <- transmitted_dat %>% 
+  #group by each individual seal
+  group_by(DeployID) %>% 
+  #create a column that starts counting at the start of each dive (segment == 0)
+  mutate(test1 = case_when(Segment == 0 ~ 1), 
+         #creates a column that counts and assigns a segment to a specific dive
+         #based on the cumulative sum of the preceding value in the test1
+         #counter & ignores NAs
+         test2 = cumsum(replace_na(test1, 0)), 
+         test3 = ifelse(is.na(Segment), NA, test2)) %>% 
+  ungroup() %>% 
+  #move those counter columns closer to the segment column to make it easier to
+  #look at
+  relocate(test1:test3, .after = Segment) %>% 
+  #fill in the NA values with the dive number based on the value right below,
+  #so it fills the data "up" instead of "down" which is the default
+  fill(test3, .direction = "up") %>% 
+  #renaming this counter column #commitment
+  rename(DiveNum = test3) %>% 
+  #deleting the counter columns and the DiveNumber column bc in this case it's
+  #empty and is confusing to work with
+  dplyr::select(-DiveNumber,-test1,-test2) %>%  
+  #Separating animalID from age and sex and deleting the messy age_sex field
+  separate(DeployID, c("animalid", "Age_Sex"), sep = " - ", remove = TRUE) %>% 
+  select(-"Age_Sex") %>% 
+  #Which seals were recovered -> survivorship metric
+  mutate(Recovered = !grepl("-Offline", file),
+         #Making Divestart into a Date-Time object
+         DiveStart = parse_date_time(DiveStart, "%H:%M:%S %d-%b-%Y "),
+         #Pulling data and time data into seperate columns
+         Date = as.Date(DiveStart),
+         Time = format(DiveStart, format = "%H:%M:%S"))%>% 
+  #Tidying data frame to appear more intuitive
+  relocate(Date:Time, .after = DiveStart) %>% 
+  relocate(Recovered, .after = animalid) %>% 
+  select(-file, -MobilityAvg, -MobilitySD, -Pitch:-TempDeep)
+  
+write_csv(transmitted_f, "data/transmitted_f.csv")
+```
+
+```{r}
+
+```
+
+```{r dive + morphology data}
+all_dat <- left_join(morphs_combined, transmitted_f, by = "animalid")
+```
+
+#### Compiling dive segments to calculate per dive summary statistics
+
+```{r}
+#Calculating maximum dive depth, no minimum because that's just 0, and total dive
+#duration for every dive in minutes
+diveStat_perDive <- transmitted_f %>% 
+  group_by(DeployID, DiveNum) %>% 
+  summarise(
+#The following values repeat for each dive segment in the raw data, so grabbing the first observation for each piece of data
+    #Deployment Season
+    DepSeason = first(DepSeason),
+    #Seal ID
+    SealID = first(SealID),
+    #Was the tag recovered?
+    Recovered = first(Recovered),
+    #Age and Sex data (numerical and factored)
+    Age = first(Age),
+    Age_f = first(Age_f),
+    Sex_f = first(Sex_f),
+    #Date-time of dive start per dive per seal
+    DateTime = first(DiveStart),
+    Date = first(Date),
+    Time = first(Time),
+    #Location quality per dive per seal
+    LocQual = first(LocationQuality),
+    #Latitude per dive per seal
+    Lat = first(Latitude),
+    #Longitude per dive per seal
+    Long = first(Longitude),
+    #select the first row of a dive that has the total duration in it, and does
+    #not have a segment assignment (hence, segment is.na) or you can do it as
+    #Duration[1]
+    #Dive duration divided by 60 to get minutes
+    DiveDur_min = round(Duration[is.na(Segment)]/60, digits = 2), 
+    #Maximum depth recorded during a dive
+    MaxDiveDepth = max(InitialDepth, na.rm = TRUE), 
+    #Average depth of a dive - ignore?
+    MeanDiveDepth = mean(InitialDepth, na.rm = TRUE), 
+    #Median depth of a dive - ignore?
+    MedDiveDepth = median(InitialDepth, na.rm = TRUE),
+    #ignore these behavior metrics?
+    #total prey capture events per dive for each seal
+    TotalPreyCap = sum(ActivityCount, na.rm = TRUE),
+    #total swim effort per dive for each seal
+    TotalSwim = sum(SwimEffort, na.rm = TRUE),
+    #Maximum swim effort per dive for each seal
+    MaxSwim = max(SwimEffort, na.rm = TRUE),
+    #Average swim effort per dive for each seal
+    MeanSwim = mean(SwimEffort, na.rm = TRUE)) %>% 
+  ungroup()
+
+write_csv(diveStat_perDive, "data/diveStat_perDive.csv")
+```
+
+##### Visualizing the distributions of some of the per-dive calculated metrics
+
+```{r per dive histogRams , message=FALSE, warning=FALSE}
+#Distribution of latitudes - look at east-west movement
+Lat_hist <- ggplot(diveStat_perDive, aes(x = Lat, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  facet_wrap(.~Age_f, scales = "free_y") +
+  ggtitle("Latitude by Age x Sex")
+Lat_hist
+
+#Distribution of longitude - look at north-south movement
+Long_hist <- ggplot(diveStat_perDive, aes(x = Long, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  facet_wrap(.~Age_f, scales = "free_y") +
+  ggtitle("Longitude by Age x Sex")
+Long_hist
+
+#Distribution of dive duration
+dDur_hist<- ggplot(diveStat_perDive, aes(x = DiveDur_min, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  facet_wrap(.~Age_f, scales = "free_y") +
+  ggtitle("Dive Duration by Age x Sex")
+dDur_hist
+
+#Distribution maximum dive depth
+maxDDepth_hist<- ggplot(diveStat_perDive, aes(y = MaxDiveDepth, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  scale_y_reverse()+
+  facet_wrap(.~Age_f, scales = "free_y") +
+  ggtitle("Max Dive Depth by Age x Sex")
+maxDDepth_hist
+
+#Distribution of mean dive depth
+meanDDepth_hist<- ggplot(diveStat_perDive, aes(y = MeanDiveDepth, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  scale_y_reverse()+
+  facet_wrap(.~Age_f, scales = "free_y")+
+  ggtitle("Mean Dive Depth by Age x Sex")
+meanDDepth_hist
+
+#Distribution of median dive depth
+medDDepth_hist<- ggplot(diveStat_perDive, aes(y = MedDiveDepth, fill = Sex_f)) + 
+  geom_histogram(width = 0.2, position = "dodge", binwidth = 10) +
+  scale_y_reverse()+
+  facet_wrap(.~Age_f, scales = "free_y") +
+  ggtitle("Median Dive Depth by Age x Sex")
+medDDepth_hist
+
+#Distribution of max dive depth x duration by Age and Sex
+dDur_maxDepth_plot <- ggplot(diveStat_perDive, 
+                            aes(x = DiveDur_min, y = MaxDiveDepth, 
+                                color = Sex_f)) + 
+  geom_jitter() +
+  scale_y_reverse()+
+  facet_wrap(.~Age_f) +
+  ggtitle("Dive Duration by Depth") +
+  geom_smooth(method = "lm")
+
+dDur_maxDepth_plot
+```
+
+Getting some weird `NA` values in `Age_f` and `Sex_f` fields. Let's try to figure it out...
+
+```{r debugging a non-error bug...per dive statistics}
+# Check for NA values in Age_f variable
+na_age <- diveStat_perDive %>%
+  filter(is.na(Age_f))
+
+# Check for NA values in the Sex_f variable
+na_sex <- diveStat_perDive %>%
+  filter(is.na(Sex_f))
+
+# Count NA values in each variable
+count_na <- diveStat_perDive %>%
+  summarise(across(c(Age_f, Sex_f), ~ sum(is.na(.))))
+
+# Print the results
+print(na_age)
+print(na_sex)
+print(count_na)
+```
+
+Hmmm...so the per dive statistics dropped some of the age and sex values for some of the seals, not sure where this happened so lets see if these `NA` values manifested in the original `transmitted_f` compiled data frame.
+
+```{r debugging a non-error bug...compiled transmitted data}
+#Check for NA values in Age_f variable
+na_age <- transmitted_f %>%
+  filter(is.na(Age_f))
+
+# Check for NA values in the Sex_f variable
+na_sex <- transmitted_f %>%
+  filter(is.na(Sex_f))
+
+# Count NA values in each variable
+count_na <- transmitted_f %>%
+  summarise(across(c(Age_f, Sex_f), ~ sum(is.na(.))))
+
+# Print the results
+print(na_age)
+print(na_sex)
+print(count_na)
+```
+
+Okay so this seemed to happen when `Age` and `Sex` were made into factored variables initially. Let's see if the originally formatted `Age` and `Sex` data were split up correctly when compiling `transmitted_f`.
+
+```{r debugging a non-error bug... non-factored age and sex data}
+# Check for NA values in Age_f variable
+na_age <- transmitted_f %>%
+  filter(is.na(Age))
+
+# Check for NA values in the Sex_f variable
+na_sex <- transmitted_f %>%
+  filter(is.na(Sex))
+
+# Count NA values in each variable
+count_na <- transmitted_f %>%
+  summarise(across(c(Age, Sex), ~ sum(is.na(.))))
+
+# Print the results
+print(na_age)
+print(na_sex)
+print(count_na)
+```
+
+Something weird happened when parsing age and sex information from the original `DeployID` column. Let's look at `SealID == K335`
+
+```{r}
+```
